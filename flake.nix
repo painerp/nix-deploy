@@ -21,8 +21,8 @@
 
         rust-toolchain = pkgs.rust-bin.stable.latest.default.override { extensions = [ "rust-src" ]; };
 
-        nix-updater = pkgs.rustPlatform.buildRustPackage {
-          pname = "nix-updater";
+        nix-deploy = pkgs.rustPlatform.buildRustPackage {
+          pname = "nix-deploy";
           version = "0.1.0";
 
           src = ./.;
@@ -53,8 +53,8 @@
       {
 
         packages = {
-          default = nix-updater;
-          nix-updater = nix-updater;
+          default = nix-deploy;
+          nix-deploy = nix-deploy;
         };
 
         devShells.default = pkgs.mkShell {
