@@ -1,27 +1,65 @@
 {
   inputs = {
-    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    flake-utils.url  = "github:numtide/flake-utils";
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    rust-overlay,
-    flake-utils,
-    ...
-  }:
-    flake-utils.lib.eachDefaultSystem
-    (
-      system: let
+  outputs =
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      flake-utils,
+      ...
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
         overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs {inherit system overlays;};
-      in rec
+        pkgs = import nixpkgs { inherit system overlays; };
+
+        rust-toolchain = pkgs.rust-bin.stable.latest.default.override { extensions = [ "rust-src" ]; };
+
+        nix-updater = pkgs.rustPlatform.buildRustPackage {
+          pname = "nix-updater";
+          version = "0.1.0";
+
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            rust-toolchain
+          ];
+
+          buildInputs = with pkgs; [
+            openssl
+            zlib
+          ];
+
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+
+          meta = with pkgs.lib; {
+            description = "TUI tool to update servers running NixOS";
+            license = licenses.mit;
+            maintainers = [ painerp ];
+          };
+        };
+      in
       {
+
+        packages = {
+          default = nix-updater;
+          nix-updater = nix-updater;
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            (rust-bin.stable.latest.default.override { extensions = [ "rust-src" ]; })
+            rust-toolchain
             pkg-config
             autoconf
             openssl
