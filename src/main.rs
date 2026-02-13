@@ -1,3 +1,8 @@
+mod progress;
+mod progress_tui;
+mod ssh_executor;
+mod updater;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
@@ -11,8 +16,14 @@ use ratatui::{
 };
 use serde::Deserialize;
 use ssh2::Session;
-use std::{collections::HashMap, io::Read, net::TcpStream, process::Command};
+use std::{collections::HashMap, net::TcpStream, process::Command};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+
+use progress::{create_progress_map, progress_monitor_task};
+use progress_tui::ProgressTui;
+use ssh_executor::execute_command_on_channel;
+use updater::update_server_with_progress;
 
 #[derive(Debug, Deserialize)]
 struct TailscaleStatus {
@@ -162,36 +173,15 @@ fn get_nixos_servers() -> Result<Vec<String>> {
     }
 
     nixos_servers.sort_by(|a, b| {
-        let a_host = a.split(":").next().unwrap_or("");
-        let b_host = b.split(":").next().unwrap_or("");
+        let a_host = a.split(':').next().unwrap_or("");
+        let b_host = b.split(':').next().unwrap_or("");
         a_host.cmp(b_host)
     });
 
     Ok(nixos_servers)
 }
 
-fn execute_command_on_channel(
-    sess: &Session,
-    command: &str,
-    forward_agent: bool,
-) -> Result<(String, i32)> {
-    let mut channel = sess.channel_session()?;
-
-    // Request agent forwarding on this channel if enabled
-    if forward_agent {
-        channel.request_auth_agent_forwarding()?;
-    }
-
-    channel.exec(command)?;
-
-    let mut output = String::new();
-    channel.read_to_string(&mut output)?;
-
-    let exit_status = channel.exit_status()?;
-
-    Ok((output, exit_status))
-}
-
+// Legacy update_server for backward compatibility (used in old code paths)
 fn update_server(
     server_info: &str,
     use_boot: bool,
@@ -371,29 +361,88 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("Updating selected servers: {:?}", selected_servers);
-
     let use_boot = args.boot;
     let forward_agent = args.forward_agent;
     let command = args.command.clone();
     let run_after = args.after;
 
+    // Create progress tracking infrastructure
+    let progress_map = create_progress_map(&selected_servers);
+    let (progress_tx, progress_rx) = mpsc::channel(1000);
+
     let rt = Runtime::new()?;
-    let results = rt.block_on(async {
-        let update_tasks = selected_servers.iter().map(|server| {
+
+    // Spawn the progress monitor task
+    let monitor_map = progress_map.clone();
+    rt.spawn(async move {
+        progress_monitor_task(progress_rx, monitor_map).await;
+    });
+
+    // Spawn update tasks
+    let update_handles: Vec<_> = selected_servers
+        .iter()
+        .map(|server| {
             let server_clone = server.clone();
             let cmd_clone = command.clone();
-            tokio::spawn(async move {
-                println!("Updating server: {}", server_clone);
-                match update_server(&server_clone, use_boot, forward_agent, cmd_clone, run_after) {
+            let tx = progress_tx.clone();
+            rt.spawn(async move {
+                match update_server_with_progress(
+                    &server_clone,
+                    use_boot,
+                    forward_agent,
+                    cmd_clone,
+                    run_after,
+                    tx,
+                )
+                .await
+                {
                     Ok((hostname, success, output)) => (hostname, success, output),
-                    Err(e) => (server_clone, false, format!("Error: {}", e)),
+                    Err(e) => {
+                        let hostname = server_clone.split(':').next().unwrap_or(&server_clone);
+                        (hostname.to_string(), false, format!("Error: {}", e))
+                    }
                 }
             })
-        });
+        })
+        .collect();
 
-        let task_results = join_all(update_tasks).await;
+    // Drop the original sender so the monitor task can complete
+    drop(progress_tx);
 
+    // Run the progress TUI
+    enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+
+    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    let mut progress_tui =
+        ProgressTui::new(selected_servers.iter().map(|s| s.to_string()).collect());
+
+    // TUI loop
+    let tui_result: Result<()> = loop {
+        terminal.draw(|frame| {
+            progress_tui.render(frame, &progress_map);
+        })?;
+
+        // Check if user wants to quit (only allowed when all complete)
+        if progress_tui.handle_input()? {
+            break Ok(());
+        }
+
+        // Check if all servers are done
+        if progress_tui.check_all_complete(&progress_map) {
+            // Wait a bit for user to review before allowing quit
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    disable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+
+    tui_result?;
+
+    // Wait for all update tasks to complete and collect results
+    let results = rt.block_on(async {
+        let task_results = join_all(update_handles).await;
         task_results
             .into_iter()
             .map(|r| {
@@ -402,7 +451,8 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
     });
 
-    println!("\n--- Update Results ---");
+    // Print final summary
+    println!("\n=== Update Summary ===");
     for (hostname, success, output) in results {
         if success {
             println!("✅ {}: Update successful", hostname);
