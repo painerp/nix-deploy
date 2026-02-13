@@ -39,10 +39,45 @@ struct TailscalePeer {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Update NixOS servers")]
+#[command(version, about = "Update NixOS servers", long_about = None)]
 struct Args {
+    /// Use 'nixos-rebuild boot' instead of 'nixos-rebuild switch'
     #[arg(short, long)]
     boot: bool,
+
+    /// Enable SSH agent forwarding (equivalent to ssh -A)
+    ///
+    /// WARNING: This allows the remote server to use your SSH agent to authenticate
+    /// to other servers. Only use this if you trust the remote server and need it
+    /// to access other systems using your credentials.
+    #[arg(long)]
+    forward_agent: bool,
+
+    /// Command to run on each server in relation to the update process
+    ///
+    /// The command will be executed via SSH. By default, it runs BEFORE the update
+    /// (git pull and nixos-rebuild). Use --after to run it after the update instead.
+    ///
+    /// When running before: If this command fails (non-zero exit code), the update
+    /// will be aborted for that server.
+    ///
+    /// When running after: The command only executes if the update succeeds. If it
+    /// fails, it will be marked as a failure but won't affect the update itself.
+    ///
+    /// Example: --command "systemctl stop myapp" (runs before by default)
+    /// Example: --command "systemctl restart myapp" --after (runs after update)
+    #[arg(long)]
+    command: Option<String>,
+
+    /// Run the command AFTER the update instead of before (default is before)
+    ///
+    /// This flag changes when --command executes. By default, commands run before
+    /// the update process. With --after, the command runs only after a successful
+    /// update (git pull and nixos-rebuild).
+    ///
+    /// Note: This flag has no effect if --command is not specified.
+    #[arg(long, requires = "command")]
+    after: bool,
 }
 
 struct ServerSelector {
@@ -135,7 +170,35 @@ fn get_nixos_servers() -> Result<Vec<String>> {
     Ok(nixos_servers)
 }
 
-fn update_server(server_info: &str, use_boot: bool) -> Result<(String, bool, String)> {
+fn execute_command_on_channel(
+    sess: &Session,
+    command: &str,
+    forward_agent: bool,
+) -> Result<(String, i32)> {
+    let mut channel = sess.channel_session()?;
+
+    // Request agent forwarding on this channel if enabled
+    if forward_agent {
+        channel.request_auth_agent_forwarding()?;
+    }
+
+    channel.exec(command)?;
+
+    let mut output = String::new();
+    channel.read_to_string(&mut output)?;
+
+    let exit_status = channel.exit_status()?;
+
+    Ok((output, exit_status))
+}
+
+fn update_server(
+    server_info: &str,
+    use_boot: bool,
+    forward_agent: bool,
+    command: Option<String>,
+    run_after: bool,
+) -> Result<(String, bool, String)> {
     let parts: Vec<&str> = server_info.split(':').collect();
     if parts.len() < 2 {
         return Ok((
@@ -164,10 +227,30 @@ fn update_server(server_info: &str, use_boot: bool) -> Result<(String, bool, Str
     let mut output = String::new();
     let mut success = true;
 
-    let mut channel = sess.channel_session()?;
-    channel.exec("test -d /etc/nixos/.git || echo 'No git repo found'")?;
-    let mut git_check = String::new();
-    channel.read_to_string(&mut git_check)?;
+    // Execute before-command if provided and run_after is false (default)
+    if !run_after {
+        if let Some(ref cmd) = command {
+            output.push_str(&format!("=== Running before-command ===\n"));
+
+            let (buf, exit_status) = execute_command_on_channel(&sess, cmd, forward_agent)?;
+            output.push_str(&format!("$ {}\n{}\n", cmd, buf));
+
+            if exit_status != 0 {
+                success = false;
+                output.push_str(&format!(
+                    "Before-command failed with exit code: {}\n",
+                    exit_status
+                ));
+                return Ok((hostname.to_string(), success, output));
+            }
+        }
+    }
+
+    let (git_check, _) = execute_command_on_channel(
+        &sess,
+        "test -d /etc/nixos/.git || echo 'No git repo found'",
+        forward_agent,
+    )?;
 
     if git_check.contains("No git repo found") {
         return Ok((
@@ -184,18 +267,30 @@ fn update_server(server_info: &str, use_boot: bool) -> Result<(String, bool, Str
     );
 
     for cmd in &["cd /etc/nixos && git pull --verbose", &rebuild_cmd] {
-        let mut channel = sess.channel_session()?;
-        channel.exec(cmd)?;
-
-        let mut buf = String::new();
-        channel.read_to_string(&mut buf)?;
+        let (buf, exit_status) = execute_command_on_channel(&sess, cmd, forward_agent)?;
         output.push_str(&format!("$ {}\n{}\n", cmd, buf));
 
-        let exit_status = channel.exit_status()?;
         if exit_status != 0 {
             success = false;
             output.push_str(&format!("Command failed with exit code: {}\n", exit_status));
             break;
+        }
+    }
+
+    // Execute after-command if provided, run_after is true, and previous commands succeeded
+    if success && run_after {
+        if let Some(ref cmd) = command {
+            output.push_str(&format!("=== Running after-command ===\n"));
+            let (buf, exit_status) = execute_command_on_channel(&sess, cmd, forward_agent)?;
+            output.push_str(&format!("$ {}\n{}\n", cmd, buf));
+
+            if exit_status != 0 {
+                success = false;
+                output.push_str(&format!(
+                    "After-command failed with exit code: {}\n",
+                    exit_status
+                ));
+            }
         }
     }
 
@@ -279,14 +374,18 @@ fn main() -> Result<()> {
     println!("Updating selected servers: {:?}", selected_servers);
 
     let use_boot = args.boot;
+    let forward_agent = args.forward_agent;
+    let command = args.command.clone();
+    let run_after = args.after;
 
     let rt = Runtime::new()?;
     let results = rt.block_on(async {
         let update_tasks = selected_servers.iter().map(|server| {
             let server_clone = server.clone();
+            let cmd_clone = command.clone();
             tokio::spawn(async move {
                 println!("Updating server: {}", server_clone);
-                match update_server(&server_clone, use_boot) {
+                match update_server(&server_clone, use_boot, forward_agent, cmd_clone, run_after) {
                     Ok((hostname, success, output)) => (hostname, success, output),
                     Err(e) => (server_clone, false, format!("Error: {}", e)),
                 }
