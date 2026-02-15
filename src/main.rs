@@ -6,7 +6,7 @@ mod updater;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::future::join_all;
@@ -289,7 +289,7 @@ fn update_server(
 
 fn run_tui() -> Result<Vec<String>> {
     enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
 
@@ -346,7 +346,7 @@ fn run_tui() -> Result<Vec<String>> {
     };
 
     disable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
     Ok(result)
 }
@@ -411,7 +411,7 @@ fn main() -> Result<()> {
 
     // Run the progress TUI
     enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let mut progress_tui =
@@ -436,7 +436,7 @@ fn main() -> Result<()> {
     };
 
     disable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
     tui_result?;
 

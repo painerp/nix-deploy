@@ -85,7 +85,43 @@ fn update_server_blocking(
     sess.set_timeout(30000);
     sess.handshake()?;
 
-    sess.userauth_agent("root")?;
+    // Try multiple authentication methods
+    let username = "root";
+    let mut authenticated = false;
+
+    // First, try SSH agent authentication
+    if let Ok(()) = sess.userauth_agent(username) {
+        authenticated = true;
+    }
+
+    // If agent auth failed, try public key authentication from default locations
+    if !authenticated {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let key_paths = vec![
+            format!("{}/.ssh/id_ed25519", home),
+            format!("{}/.ssh/id_rsa", home),
+            format!("{}/.ssh/id_ecdsa", home),
+        ];
+
+        for key_path in key_paths {
+            if std::path::Path::new(&key_path).exists() {
+                if let Ok(()) =
+                    sess.userauth_pubkey_file(username, None, std::path::Path::new(&key_path), None)
+                {
+                    authenticated = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !authenticated {
+        return Ok((
+            hostname.to_string(),
+            false,
+            "Failed to authenticate with SSH. Please ensure SSH agent is running or SSH keys are available.".to_string(),
+        ));
+    }
 
     let mut output = String::new();
     let mut success = true;

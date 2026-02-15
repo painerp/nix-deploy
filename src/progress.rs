@@ -32,8 +32,8 @@ impl UpdatePhase {
                 }
             }
             UpdatePhase::RunningAfterCommand => "Running after-command...".to_string(),
-            UpdatePhase::Success => "✅ Success".to_string(),
-            UpdatePhase::Failed { reason } => format!("❌ Failed: {}", reason),
+            UpdatePhase::Success => "✓ Success".to_string(),
+            UpdatePhase::Failed { reason } => format!("✗ Failed: {}", reason),
         }
     }
 

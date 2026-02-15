@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -14,6 +14,10 @@ pub struct ProgressTui {
     scroll_offset: usize,
     all_complete: bool,
     ctrl_c_count: u8,
+    auto_scroll: bool,
+    max_scroll: usize,
+    server_list_area: Rect,
+    output_area: Rect,
 }
 
 impl ProgressTui {
@@ -24,12 +28,18 @@ impl ProgressTui {
             scroll_offset: 0,
             all_complete: false,
             ctrl_c_count: 0,
+            auto_scroll: true,
+            max_scroll: 0,
+            server_list_area: Rect::default(),
+            output_area: Rect::default(),
         }
     }
 
     pub fn next(&mut self) {
         if !self.server_list.is_empty() {
             self.selected_index = (self.selected_index + 1) % self.server_list.len();
+            self.scroll_offset = 0;
+            self.auto_scroll = true;
         }
     }
 
@@ -40,6 +50,25 @@ impl ProgressTui {
             } else {
                 self.selected_index - 1
             };
+            self.scroll_offset = 0;
+            self.auto_scroll = true;
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_sub(5);
+            self.auto_scroll = false;
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        if self.scroll_offset < self.max_scroll {
+            self.scroll_offset = (self.scroll_offset + 5).min(self.max_scroll);
+            // Re-enable auto-scroll if we're at the bottom
+            if self.scroll_offset >= self.max_scroll {
+                self.auto_scroll = true;
+            }
         }
     }
 
@@ -51,6 +80,10 @@ impl ProgressTui {
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(area);
+
+        // Store areas for mouse click detection
+        self.server_list_area = chunks[0];
+        self.output_area = chunks[1];
 
         // Render server list
         self.render_server_list(frame, chunks[0], progress_map);
@@ -111,19 +144,28 @@ impl ProgressTui {
         let line_count = output.lines().count();
         let visible_lines = (area.height.saturating_sub(2)) as usize; // Subtract borders
 
-        // Auto-scroll to bottom if not manually scrolled
-        if self.scroll_offset + visible_lines >= line_count.saturating_sub(1) {
-            self.scroll_offset = line_count.saturating_sub(visible_lines).max(0);
+        // Calculate max scroll position
+        self.max_scroll = line_count.saturating_sub(visible_lines);
+
+        // Auto-scroll to bottom if enabled
+        if self.auto_scroll {
+            self.scroll_offset = self.max_scroll;
         }
 
         let selected_hostname = selected_server
             .map(|s| s.split(':').next().unwrap_or(s))
             .unwrap_or("None");
 
+        let scroll_indicator = if self.auto_scroll {
+            ""
+        } else {
+            " [Manual Scroll - PgDn to resume auto-scroll]"
+        };
+
         let paragraph = Paragraph::new(output)
             .block(
                 Block::default()
-                    .title(format!("Output: {}", selected_hostname))
+                    .title(format!("Output: {}{}", selected_hostname, scroll_indicator))
                     .borders(Borders::ALL),
             )
             .wrap(Wrap { trim: false })
@@ -147,39 +189,107 @@ impl ProgressTui {
     pub fn handle_input(&mut self) -> Result<bool> {
         // Non-blocking check for input with small timeout
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Up => {
-                            self.previous();
-                            self.ctrl_c_count = 0; // Reset on other key
-                            return Ok(false);
-                        }
-                        KeyCode::Down => {
-                            self.next();
-                            self.ctrl_c_count = 0; // Reset on other key
-                            return Ok(false);
-                        }
-                        KeyCode::Char('c')
-                            if key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                        {
-                            self.ctrl_c_count += 1;
-                            if self.ctrl_c_count >= 2 {
-                                return Ok(true); // Signal to quit immediately
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Up => {
+                                self.previous();
+                                self.ctrl_c_count = 0; // Reset on other key
+                                return Ok(false);
                             }
-                            // Don't reset - let it accumulate
-                            return Ok(false);
-                        }
-                        KeyCode::Char('q') if self.all_complete => {
-                            return Ok(true); // Signal to quit
-                        }
-                        _ => {
-                            self.ctrl_c_count = 0; // Reset on other key
+                            KeyCode::Down => {
+                                self.next();
+                                self.ctrl_c_count = 0; // Reset on other key
+                                return Ok(false);
+                            }
+                            KeyCode::PageUp => {
+                                self.scroll_up();
+                                self.ctrl_c_count = 0;
+                                return Ok(false);
+                            }
+                            KeyCode::PageDown => {
+                                self.scroll_down();
+                                self.ctrl_c_count = 0;
+                                return Ok(false);
+                            }
+                            KeyCode::Char('c')
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                self.ctrl_c_count += 1;
+                                if self.ctrl_c_count >= 2 {
+                                    return Ok(true); // Signal to quit immediately
+                                }
+                                // Don't reset - let it accumulate
+                                return Ok(false);
+                            }
+                            KeyCode::Char('q') if self.all_complete => {
+                                return Ok(true); // Signal to quit
+                            }
+                            _ => {
+                                self.ctrl_c_count = 0; // Reset on other key
+                            }
                         }
                     }
                 }
+                Event::Mouse(mouse) => {
+                    // Skip mouse move and drag events early - they generate tons of events
+                    if !matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(_)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                    ) {
+                        return Ok(false);
+                    }
+
+                    self.ctrl_c_count = 0; // Reset on mouse events
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // Check if click is in server list area
+                            if mouse.column >= self.server_list_area.x
+                                && mouse.column
+                                    < self.server_list_area.x + self.server_list_area.width
+                                && mouse.row >= self.server_list_area.y
+                                && mouse.row
+                                    < self.server_list_area.y + self.server_list_area.height
+                            {
+                                // Calculate which server was clicked (accounting for border)
+                                let relative_y =
+                                    mouse.row.saturating_sub(self.server_list_area.y + 1);
+                                if relative_y < self.server_list.len() as u16 {
+                                    self.selected_index = relative_y as usize;
+                                    self.scroll_offset = 0;
+                                    self.auto_scroll = true;
+                                }
+                            }
+                        }
+                        MouseEventKind::ScrollUp => {
+                            // Check if mouse is over output area for scrolling
+                            if mouse.column >= self.output_area.x
+                                && mouse.column < self.output_area.x + self.output_area.width
+                                && mouse.row >= self.output_area.y
+                                && mouse.row < self.output_area.y + self.output_area.height
+                            {
+                                self.scroll_up();
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            // Check if mouse is over output area for scrolling
+                            if mouse.column >= self.output_area.x
+                                && mouse.column < self.output_area.x + self.output_area.width
+                                && mouse.row >= self.output_area.y
+                                && mouse.row < self.output_area.y + self.output_area.height
+                            {
+                                self.scroll_down();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
         Ok(false) // Continue running
