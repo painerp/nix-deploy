@@ -419,19 +419,17 @@ fn main() -> Result<()> {
 
     // TUI loop
     let tui_result: Result<()> = loop {
+        // Check if all servers are done and update TUI state
+        progress_tui.check_all_complete(&progress_map);
+
         terminal.draw(|frame| {
             progress_tui.render(frame, &progress_map);
         })?;
 
-        // Check if user wants to quit (only allowed when all complete)
+        // Check if user wants to quit
+        // handle_input() has a built-in timeout, no need for additional sleep
         if progress_tui.handle_input()? {
             break Ok(());
-        }
-
-        // Check if all servers are done
-        if progress_tui.check_all_complete(&progress_map) {
-            // Wait a bit for user to review before allowing quit
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     };
 

@@ -85,16 +85,22 @@ impl ProgressTui {
         self.server_list_area = chunks[0];
         self.output_area = chunks[1];
 
-        // Render server list
-        self.render_server_list(frame, chunks[0], progress_map);
-
-        // Render output pane
-        self.render_output_pane(frame, chunks[1], progress_map);
-    }
-
-    fn render_server_list(&self, frame: &mut Frame, area: Rect, progress_map: &ProgressMap) {
+        // Lock the progress map once for the entire render
         let map = progress_map.lock().unwrap();
 
+        // Render server list
+        self.render_server_list(frame, chunks[0], &map);
+
+        // Render output pane
+        self.render_output_pane(frame, chunks[1], &map);
+    }
+
+    fn render_server_list(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        map: &std::collections::HashMap<String, crate::progress::ServerProgress>,
+    ) {
         let items: Vec<ListItem> = self
             .server_list
             .iter()
@@ -127,9 +133,12 @@ impl ProgressTui {
         frame.render_widget(list, area);
     }
 
-    fn render_output_pane(&mut self, frame: &mut Frame, area: Rect, progress_map: &ProgressMap) {
-        let map = progress_map.lock().unwrap();
-
+    fn render_output_pane(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        map: &std::collections::HashMap<String, crate::progress::ServerProgress>,
+    ) {
         let selected_server = self.server_list.get(self.selected_index);
         let output = if let Some(server) = selected_server {
             let hostname = server.split(':').next().unwrap_or(server);
@@ -187,8 +196,9 @@ impl ProgressTui {
     }
 
     pub fn handle_input(&mut self) -> Result<bool> {
-        // Non-blocking check for input with small timeout
-        if event::poll(Duration::from_millis(100))? {
+        // Very short poll timeout for responsive input
+        // This is the only delay in the main loop, so keep it minimal
+        if event::poll(Duration::from_millis(10))? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
@@ -219,10 +229,11 @@ impl ProgressTui {
                                     .contains(crossterm::event::KeyModifiers::CONTROL) =>
                             {
                                 self.ctrl_c_count += 1;
-                                if self.ctrl_c_count >= 2 {
-                                    return Ok(true); // Signal to quit immediately
+                                // If all complete, quit immediately
+                                // Otherwise require 2 presses to force quit
+                                if self.all_complete || self.ctrl_c_count >= 2 {
+                                    return Ok(true); // Signal to quit
                                 }
-                                // Don't reset - let it accumulate
                                 return Ok(false);
                             }
                             KeyCode::Char('q') if self.all_complete => {

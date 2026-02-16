@@ -31,6 +31,150 @@ pub async fn update_server_with_progress(
     .await?
 }
 
+fn authenticate_ssh_session(
+    sess: &Session,
+    username: &str,
+    hostname: &str,
+    progress_tx: &mpsc::Sender<ProgressUpdate>,
+) -> Result<bool> {
+    let mut authenticated = false;
+    let mut auth_errors = Vec::new();
+
+    // Strategy 1: Try file-based SSH keys first
+    // This works for both regular SSH and Tailscale SSH (which accepts any key)
+    let _ = progress_tx.try_send(ProgressUpdate {
+        hostname: hostname.to_string(),
+        phase: UpdatePhase::Connecting,
+        output_line: Some("Trying file-based SSH keys...".to_string()),
+    });
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let key_paths = vec![
+        format!("{}/.ssh/id_ed25519", home),
+        format!("{}/.ssh/id_rsa", home),
+        format!("{}/.ssh/id_ecdsa", home),
+        format!("{}/.ssh/id_dsa", home),
+    ];
+
+    for key_path in &key_paths {
+        if std::path::Path::new(&key_path).exists() {
+            match sess.userauth_pubkey_file(username, None, std::path::Path::new(&key_path), None) {
+                Ok(()) => {
+                    if sess.authenticated() {
+                        authenticated = true;
+                        let _ = progress_tx.try_send(ProgressUpdate {
+                            hostname: hostname.to_string(),
+                            phase: UpdatePhase::Connecting,
+                            output_line: Some(format!("✓ Authenticated with key: {}", key_path)),
+                        });
+                        return Ok(authenticated);
+                    }
+                }
+                Err(e) => {
+                    auth_errors.push(format!("Key {}: {}", key_path, e));
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Try SSH agent (for keys not available as files)
+    let _ = progress_tx.try_send(ProgressUpdate {
+        hostname: hostname.to_string(),
+        phase: UpdatePhase::Connecting,
+        output_line: Some("Trying SSH agent authentication...".to_string()),
+    });
+
+    // First attempt: Let libssh2 handle agent authentication automatically
+    match sess.userauth_agent(username) {
+        Ok(()) => {
+            if sess.authenticated() {
+                let _ = progress_tx.try_send(ProgressUpdate {
+                    hostname: hostname.to_string(),
+                    phase: UpdatePhase::Connecting,
+                    output_line: Some("✓ Authenticated via SSH agent".to_string()),
+                });
+                return Ok(true);
+            }
+        }
+        Err(e) => {
+            auth_errors.push(format!("SSH agent automatic: {}", e));
+        }
+    }
+
+    // Strategy 3: Manually iterate through agent keys
+    // Some servers require specific keys that the automatic method doesn't try properly
+    let _ = progress_tx.try_send(ProgressUpdate {
+        hostname: hostname.to_string(),
+        phase: UpdatePhase::Connecting,
+        output_line: Some("Trying manual agent key iteration...".to_string()),
+    });
+
+    if let Ok(mut agent) = sess.agent() {
+        if let Ok(()) = agent.connect() {
+            if let Ok(()) = agent.list_identities() {
+                if let Ok(identities) = agent.identities() {
+                    let _ = progress_tx.try_send(ProgressUpdate {
+                        hostname: hostname.to_string(),
+                        phase: UpdatePhase::Connecting,
+                        output_line: Some(format!("Found {} key(s) in agent", identities.len())),
+                    });
+
+                    for (idx, identity) in identities.iter().enumerate() {
+                        if sess.authenticated() {
+                            break;
+                        }
+
+                        let comment = identity.comment();
+                        let _ = progress_tx.try_send(ProgressUpdate {
+                            hostname: hostname.to_string(),
+                            phase: UpdatePhase::Connecting,
+                            output_line: Some(format!("  Trying key #{}: {}", idx + 1, comment)),
+                        });
+
+                        match agent.userauth(username, identity) {
+                            Ok(()) => {
+                                if sess.authenticated() {
+                                    authenticated = true;
+                                    let _ = progress_tx.try_send(ProgressUpdate {
+                                        hostname: hostname.to_string(),
+                                        phase: UpdatePhase::Connecting,
+                                        output_line: Some(format!(
+                                            "✓ Authenticated with agent key: {}",
+                                            comment
+                                        )),
+                                    });
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                auth_errors.push(format!("Agent key '{}': {}", comment, e));
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = agent.disconnect();
+        }
+    }
+
+    if !authenticated {
+        let error_msg = format!(
+            "Failed to authenticate with SSH for {}.\n\nAttempted methods:\n{}",
+            hostname,
+            auth_errors.join("\n")
+        );
+        let _ = progress_tx.try_send(ProgressUpdate {
+            hostname: hostname.to_string(),
+            phase: UpdatePhase::Failed {
+                reason: "SSH authentication failed".to_string(),
+            },
+            output_line: Some(error_msg),
+        });
+    }
+
+    Ok(authenticated)
+}
+
 fn update_server_blocking(
     server_info: &str,
     use_boot: bool,
@@ -64,62 +208,34 @@ fn update_server_blocking(
         output_line: Some(format!("Connecting to {}...", ip)),
     });
 
-    // Add timeout to SSH connection (30 seconds)
-    let timeout = Duration::from_secs(30);
+    // Connect to server with timeout
+    let timeout = Duration::from_secs(60);
     let addr = format!("{}:22", ip)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow::anyhow!("Failed to resolve address: {}", ip))?;
 
     let tcp = TcpStream::connect_timeout(&addr, timeout)
-        .map_err(|e| anyhow::anyhow!("Connection timeout or failed after 30 seconds: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Connection timeout or failed after 60 seconds: {}", e))?;
 
-    // Set read/write timeouts on the socket
-    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
 
+    // Set up SSH session
     let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);
-
-    // Set timeout for SSH handshake and operations (30 seconds in milliseconds)
-    sess.set_timeout(30000);
+    sess.set_timeout(30000); // 30 second timeout
     sess.handshake()?;
 
-    // Try multiple authentication methods
+    // Authenticate
     let username = "root";
-    let mut authenticated = false;
-
-    // First, try SSH agent authentication
-    if let Ok(()) = sess.userauth_agent(username) {
-        authenticated = true;
-    }
-
-    // If agent auth failed, try public key authentication from default locations
-    if !authenticated {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let key_paths = vec![
-            format!("{}/.ssh/id_ed25519", home),
-            format!("{}/.ssh/id_rsa", home),
-            format!("{}/.ssh/id_ecdsa", home),
-        ];
-
-        for key_path in key_paths {
-            if std::path::Path::new(&key_path).exists() {
-                if let Ok(()) =
-                    sess.userauth_pubkey_file(username, None, std::path::Path::new(&key_path), None)
-                {
-                    authenticated = true;
-                    break;
-                }
-            }
-        }
-    }
+    let authenticated = authenticate_ssh_session(&sess, username, hostname, &progress_tx)?;
 
     if !authenticated {
         return Ok((
             hostname.to_string(),
             false,
-            "Failed to authenticate with SSH. Please ensure SSH agent is running or SSH keys are available.".to_string(),
+            "SSH authentication failed".to_string(),
         ));
     }
 
