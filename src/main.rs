@@ -386,20 +386,33 @@ fn main() -> Result<()> {
             let cmd_clone = command.clone();
             let tx = progress_tx.clone();
             rt.spawn(async move {
+                let hostname = server_clone
+                    .split(':')
+                    .next()
+                    .unwrap_or(&server_clone)
+                    .to_string();
                 match update_server_with_progress(
                     &server_clone,
                     use_boot,
                     forward_agent,
                     cmd_clone,
                     run_after,
-                    tx,
+                    tx.clone(),
                 )
                 .await
                 {
                     Ok((hostname, success, output)) => (hostname, success, output),
                     Err(e) => {
-                        let hostname = server_clone.split(':').next().unwrap_or(&server_clone);
-                        (hostname.to_string(), false, format!("Error: {}", e))
+                        let error_msg = format!("Error: {}", e);
+                        // Send error to TUI immediately
+                        let _ = tx.try_send(progress::ProgressUpdate {
+                            hostname: hostname.clone(),
+                            phase: progress::UpdatePhase::Failed {
+                                reason: error_msg.clone(),
+                            },
+                            output_line: Some(error_msg.clone()),
+                        });
+                        (hostname, false, error_msg)
                     }
                 }
             })

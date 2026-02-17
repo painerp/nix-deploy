@@ -52,12 +52,15 @@ pub fn execute_command_streaming(
     let mut full_output = String::new();
     let mut buffer = [0u8; 4096];
     let mut line_buffer = String::new();
+    let mut consecutive_would_block = 0;
+    let max_consecutive_would_block = 6000; // 6000 * 50ms = 5 minutes
 
     // Read from the channel in chunks
     loop {
         match channel.read(&mut buffer) {
             Ok(0) => break, // EOF
             Ok(n) => {
+                consecutive_would_block = 0; // Reset counter when data is received
                 let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
                 full_output.push_str(&chunk);
 
@@ -134,10 +137,35 @@ pub fn execute_command_streaming(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No data available, sleep briefly
+                consecutive_would_block += 1;
+                if consecutive_would_block > max_consecutive_would_block {
+                    let error_msg = format!(
+                        "Timeout: No data received from channel for {} seconds",
+                        (max_consecutive_would_block * 50) / 1000
+                    );
+                    // Send error to TUI immediately
+                    let _ = progress_tx.try_send(ProgressUpdate {
+                        hostname: hostname.to_string(),
+                        phase: UpdatePhase::Failed {
+                            reason: error_msg.clone(),
+                        },
+                        output_line: Some(error_msg.clone()),
+                    });
+                    return Err(anyhow::anyhow!("{}", error_msg));
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => {
-                return Err(anyhow::anyhow!("Error reading from channel: {}", e));
+                let error_msg = format!("Error reading from channel: {}", e);
+                // Send error to TUI immediately
+                let _ = progress_tx.try_send(ProgressUpdate {
+                    hostname: hostname.to_string(),
+                    phase: UpdatePhase::Failed {
+                        reason: error_msg.clone(),
+                    },
+                    output_line: Some(error_msg.clone()),
+                });
+                return Err(anyhow::anyhow!("{}", error_msg));
             }
         }
 

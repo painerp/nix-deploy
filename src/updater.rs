@@ -218,14 +218,18 @@ fn update_server_blocking(
     let tcp = TcpStream::connect_timeout(&addr, timeout)
         .map_err(|e| anyhow::anyhow!("Connection timeout or failed after 60 seconds: {}", e))?;
 
-    tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
+    // Set longer timeouts for read/write operations since builds can take a while
+    tcp.set_read_timeout(Some(Duration::from_secs(300)))?; // 5 minutes
+    tcp.set_write_timeout(Some(Duration::from_secs(300)))?; // 5 minutes
 
     // Set up SSH session
     let mut sess = Session::new()?;
     sess.set_tcp_stream(tcp);
-    sess.set_timeout(30000); // 30 second timeout
+    sess.set_timeout(300000); // 300 second (5 minute) timeout
     sess.handshake()?;
+
+    // Set to non-blocking mode to properly handle timeouts
+    sess.set_blocking(false);
 
     // Authenticate
     let username = "root";
