@@ -228,8 +228,9 @@ fn update_server_blocking(
     sess.set_timeout(300000); // 300 second (5 minute) timeout
     sess.handshake()?;
 
-    // Set to non-blocking mode to properly handle timeouts
-    sess.set_blocking(false);
+    // Keep blocking mode for all operations
+    // The session is already in blocking mode by default after handshake
+    sess.set_blocking(true);
 
     // Authenticate
     let username = "root";
